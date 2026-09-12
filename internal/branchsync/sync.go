@@ -119,6 +119,25 @@ type NextAction struct {
 	Command string
 }
 
+// The two custody-recovery commands recovery discovery can offer. They are
+// constants because the CLI and TUI decide which recovery a state actually
+// permits by comparing against them: recoverySourceAvailable is the single
+// owner of that choice, so no surface may re-derive it from its own evidence.
+const (
+	RecoverCustodyCommand          = "no-mistakes axi sync --recover"
+	RecoverCustodyKeepLocalCommand = "no-mistakes axi sync --recover --keep-local"
+)
+
+// KeepLocalRecoveryOffered reports whether the custody recovery this state
+// offers is the keep-local variant, which is the only one that can move a gate
+// branch. Plain --recover refuses those states, so a surface that offers it
+// anyway sends the operator into a guaranteed refusal.
+func KeepLocalRecoveryOffered(state *State) bool {
+	return state != nil && state.NextAction != nil &&
+		state.NextAction.Code == "recover_custody" &&
+		state.NextAction.Command == RecoverCustodyKeepLocalCommand
+}
+
 // RecoveryEvidence describes the exact preservation proof behind a recovery
 // action. Bound archive recovery is deliberately keep-local-only: the archive
 // preserves the divergent later head while custody returns at RequiredHead.
@@ -580,6 +599,10 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //	relation   worktree  default                        --keep-local
 //	equal      any       anchor locally; return custody same
 //	ahead      any       anchor locally; return custody same
+//	equal or   any       refuse (gate branch diverged,  custody at local head;
+//	ahead,               keep-local named)              gate reset to it (CAS)
+//	gate ref
+//	diverged
 //	behind     clean     strict fast-forward to P,      custody at local head;
 //	                     then return custody            gate reset to it (CAS)
 //	behind     dirty     refuse (commit/stash first)    custody at local head;
@@ -618,6 +641,14 @@ func (s *Service) BindRecoveryArchive(ctx context.Context, archiveRef string) St
 //     gate's run-specific recovery ref and fetched into that anchor. Legacy terminal
 //     heads that still exist as unreferenced gate objects are anchored before
 //     recovery continues. The branch ref may independently lag or advance.
+//   - Returned custody must be usable, so the equal and ahead cells also verify
+//     the gate's own refs/heads/<branch>: a run that rewrote history in its
+//     DETACHED worktree can strand that shared ref at a commit the recovered
+//     head does not descend from, which rejects the operator's next
+//     `no-mistakes axi run` push non-fast-forward. Stamping custody there
+//     reported a recovery that never happened, so plain --recover refuses and
+//     names the keep-local action instead (divergentGateBranch,
+//     divergentGateRecoveryRefusal).
 //   - The only possible worktree mutation is a guarded move of a clean checked-out
 //     branch: a strict fast-forward, or an anchored move to a proven-containing
 //     head performed by Git operations that refuse on their own rather than by a
@@ -735,7 +766,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		if !keepLocal {
 			blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_archive_requires_keep_local", fmt.Sprintf("the later pipeline head %s is preserved at %s, but it diverges from required head %s; run only the offered keep-local custody recovery; no files or refs were changed", preserved, source.archive.ArchiveRef, source.archive.RequiredHeadSHA))
 			blocked.Recovery = source.evidence
-			blocked.NextAction = &NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover --keep-local"}
+			blocked.NextAction = &NextAction{Code: "recover_custody", Command: RecoverCustodyKeepLocalCommand}
 			return blocked
 		}
 		if !gateAvailable {
@@ -753,6 +784,12 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	}
 
 	if objectExists(ctx, wd, preserved) && (local == preserved || isAncestor(ctx, wd, preserved, local)) {
+		// finishReachablePreservedRecover refuses this too; running the guard
+		// here as well keeps the refusal ahead of every anchor write, so the
+		// ordinary case mutates nothing at all.
+		if blocked, refused := s.divergentGateRecoveryRefusal(ctx, state, keepLocal); refused {
+			return blocked
+		}
 		if blocked, ok := s.anchorReachablePreserved(ctx, state, run.ID, preserved); !ok {
 			return blocked
 		}
@@ -762,10 +799,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_anchor_mismatch", "the run recovery ref in the local gate conflicts with the recorded pipeline head; inspect both objects before returning custody; no files or refs were changed")
 			}
 		}
-		if keepLocal {
-			return s.finishKeepLocalRecover(ctx, state, []string{run.ID})
-		}
-		return s.finishRecover(ctx, run, false)
+		return s.finishReachablePreservedRecover(ctx, run, state, keepLocal)
 	}
 
 	if !gateAvailable {
@@ -813,10 +847,7 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	case local == preserved, isAncestor(ctx, wd, preserved, local):
 		// Equal or ahead, discovered only after anchoring made the preserved
 		// head comparable locally.
-		if keepLocal {
-			return s.finishKeepLocalRecover(ctx, state, []string{run.ID})
-		}
-		return s.finishRecover(ctx, run, false)
+		return s.finishReachablePreservedRecover(ctx, run, state, keepLocal)
 	case isAncestor(ctx, wd, local, preserved):
 		if keepLocal {
 			return s.recoverKeepLocalAtCurrentHead(ctx, run, state, []string{run.ID}, []string{run.HeadSHA})
@@ -846,6 +877,47 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 		blocked.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "git log --oneline --left-right HEAD..." + anchorRef}
 		return blocked
 	}
+}
+
+// divergentGateRecoveryRefusal refuses an equal/ahead recovery that plain
+// --recover cannot honestly complete. Custody is only usable if the operator
+// can push the branch again, and plain --recover never moves the gate branch in
+// any cell, so a divergent gate head (see divergentGateBranch) would leave a
+// branch whose next `no-mistakes axi run` push is rejected non-fast-forward.
+// Stamping custody there reported a recovery that never happened. The guard
+// runs before recovery writes any anchor so the ordinary case mutates nothing.
+func (s *Service) divergentGateRecoveryRefusal(ctx context.Context, state State, keepLocal bool) (State, bool) {
+	if keepLocal {
+		return State{}, false
+	}
+	gateHead, divergent := s.divergentGateBranch(ctx, state.Local.Branch, state.Local.Head)
+	if !divergent {
+		return State{}, false
+	}
+	blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the local gate branch %s is at %s, which the local head %s does not descend from, so returning custody here would leave a branch the next run cannot push; re-run the offered keep-local custody recovery to move the gate branch to the kept local head; the branch, worktree, and custody record were not changed", state.Local.Branch, gateHead, state.Local.Head))
+	blocked.NextAction = &NextAction{Code: "recover_custody", Command: RecoverCustodyKeepLocalCommand}
+	return blocked, true
+}
+
+// finishReachablePreservedRecover completes the equal/ahead cells, where the
+// preserved pipeline head is already reachable from the local branch so no
+// worktree move is required. It re-applies divergentGateRecoveryRefusal rather
+// than trusting a caller to have done so, which leaves --keep-local as the only
+// way a divergent gate branch reaches the move below: that is exactly the
+// operator's "keep my head, move the gate to it" choice, so it takes the same
+// guarded CAS path the behind and diverged cells use, anchoring the replaced
+// gate head first.
+func (s *Service) finishReachablePreservedRecover(ctx context.Context, run *db.Run, state State, keepLocal bool) State {
+	if blocked, refused := s.divergentGateRecoveryRefusal(ctx, state, keepLocal); refused {
+		return blocked
+	}
+	if gateHead, divergent := s.divergentGateBranch(ctx, state.Local.Branch, state.Local.Head); divergent {
+		return s.recoverKeepLocal(ctx, run, state, gateHead, []string{run.ID}, []string{run.HeadSHA})
+	}
+	if keepLocal {
+		return s.finishKeepLocalRecover(ctx, state, []string{run.ID})
+	}
+	return s.finishRecover(ctx, run, false)
 }
 
 // recoverKeepLocal performs the explicit keep-local custody return: the
@@ -1749,7 +1821,7 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 			if allEligible {
 				state.Safety = "blocked_recover_preserved_head_missing"
 				state.Error = "a stranded run's recorded pipeline head is not available in the invoking worktree or local gate; recover custody by keeping the current local head, which discards the missing preserved commits"
-				state.NextAction = &NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover --keep-local"}
+				state.NextAction = &NextAction{Code: "recover_custody", Command: RecoverCustodyKeepLocalCommand}
 				return
 			}
 			state.Safety = "blocked_recover_manual_reconciliation"
@@ -1774,9 +1846,12 @@ func (s *Service) classifyPipelineOwned(ctx context.Context, state *State, run *
 		}
 		state.Safety = "blocked_pipeline_owned_recoverable"
 		state.Recovery = source.evidence
-		if source.archive != nil {
+		switch {
+		case source.archive != nil:
 			state.Error = fmt.Sprintf("the run finished %s with divergent later work preserved at verified archive %s; recover custody at exact required head %s before any local follow-up commit", run.Status, source.archive.ArchiveRef, source.archive.RequiredHeadSHA)
-		} else {
+		case source.err != "":
+			state.Error = source.err
+		default:
 			state.Error = "the run finished " + string(run.Status) + " with unpublished pipeline commits preserved in the local gate; recover custody before any local follow-up commit"
 		}
 		action := source.action
@@ -1954,9 +2029,25 @@ func (s *Service) recoverySourceAvailable(ctx context.Context, state *State, run
 		ordinaryAvailable = isAncestor(ctx, gateDir, local, preserved) || preservedContainsLocalWork(ctx, gateDir, local, preserved)
 	}
 	if ordinaryAvailable {
+		// The equal/ahead cells leave the worktree where it is, so the only
+		// thing that can still make the returned branch unusable is a gate
+		// branch ref the local head does not descend from. Recover refuses that
+		// state under plain --recover, so discovery must offer the keep-local
+		// action that can actually resolve it rather than a command that will
+		// refuse. Behind and diverged sources are unaffected: their recovery
+		// moves the worktree onto the preserved head the gate already holds.
+		if localEligible {
+			if gateHead, divergent := s.divergentGateBranch(ctx, state.Local.Branch, local); divergent {
+				return recoverySourceProof{
+					available: true,
+					action:    NextAction{Code: "recover_custody", Command: RecoverCustodyKeepLocalCommand},
+					err:       fmt.Sprintf("the run finished %s with unpublished pipeline commits already reachable locally, but the local gate branch %s is at %s, which the local head %s does not descend from; recover custody by keeping the current local head, which moves the gate branch to it", run.Status, state.Local.Branch, gateHead, local),
+				}
+			}
+		}
 		return recoverySourceProof{
 			available: true,
-			action:    NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover"},
+			action:    NextAction{Code: "recover_custody", Command: RecoverCustodyCommand},
 		}
 	}
 	if archiveProof.available {
@@ -2107,7 +2198,7 @@ func (s *Service) verifyRecoveryArchiveRecord(ctx context.Context, state *State,
 	}
 
 	proof.available = true
-	proof.action = NextAction{Code: "recover_custody", Command: "no-mistakes axi sync --recover --keep-local"}
+	proof.action = NextAction{Code: "recover_custody", Command: RecoverCustodyKeepLocalCommand}
 	proof.evidence.Proof = "verified"
 	return proof
 }
@@ -2229,6 +2320,44 @@ func pushStepRunning(database *db.DB, runID string) bool {
 		}
 	}
 	return false
+}
+
+// divergentGateBranch reports a gate branch ref the operator could not push
+// over: it exists and the head custody would be returned at is neither the gate
+// head itself nor a descendant of it, so the next `no-mistakes axi run` push is
+// rejected non-fast-forward and the returned branch is unusable.
+//
+// The reachable-preserved (equal/ahead) recovery cells otherwise decide the
+// gate needs nothing purely from the worktree's relation to the RECORDED
+// pipeline head, and never read refs/heads/<branch> at all. That held while the
+// only way to reach those cells was a gate branch at (or behind) the preserved
+// head, but a run that rewrote history in its DETACHED worktree could strand
+// the gate's shared branch ref at the pre-rebase commit - not an ancestor of
+// the rewritten head. Recovery then stamped custody over a branch that still
+// could not be pushed, reporting recovered:true, changed:false forever after.
+//
+// Ancestry is decided in the invoking worktree, which holds the candidate head
+// by construction: a gate head absent from a complete local history cannot be
+// an ancestor of a commit that history contains, so a missing object is
+// divergence rather than an undecidable case. An absent gate branch is not
+// divergence - a fresh push simply creates it.
+func (s *Service) divergentGateBranch(ctx context.Context, branch, head string) (string, bool) {
+	gateDir := strings.TrimSpace(s.GateDir)
+	if gateDir == "" || strings.TrimSpace(branch) == "" || strings.TrimSpace(head) == "" {
+		return "", false
+	}
+	if _, err := os.Stat(gateDir); err != nil {
+		return "", false
+	}
+	gateHead, exists, err := git.ExactRefTarget(ctx, gateDir, "refs/heads/"+branch)
+	if err != nil || !exists || gateHead == "" || gateHead == head {
+		return "", false
+	}
+	wd := s.workDir()
+	if objectExists(ctx, wd, gateHead) && isAncestor(ctx, wd, gateHead, head) {
+		return "", false
+	}
+	return gateHead, true
 }
 
 func objectExists(ctx context.Context, dir, sha string) bool {

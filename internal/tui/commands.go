@@ -368,7 +368,10 @@ func (m Model) applyRecoverCmd() tea.Cmd {
 	if recover == nil {
 		return nil
 	}
-	keepLocal := m.branchSync != nil && m.branchSync.Recovery != nil && m.branchSync.Recovery.KeepLocal
+	// recoverySourceAvailable owns which recovery a state permits; the offered
+	// command is that decision, so never re-derive it from archive evidence
+	// alone - a divergent gate branch is keep-local-only with no archive.
+	keepLocal := branchsync.KeepLocalRecoveryOffered(m.branchSync)
 	return func() tea.Msg {
 		started := time.Now()
 		state := recover(keepLocal)

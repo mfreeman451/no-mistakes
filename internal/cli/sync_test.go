@@ -529,6 +529,117 @@ func cliRecoveryGitSnapshot(t *testing.T, f cliRecoverFixture) string {
 	}, "\n---\n")
 }
 
+// newCLIStaleGateBranchFixture reproduces the second custody defect end to end:
+// the run rewrote history in its DETACHED gate worktree, so the gate's shared
+// refs/heads/<branch> is still the pre-rebase commit while the operator holds
+// the verified pipeline head. `axi sync --recover --keep-local` used to report
+// recovered:true / changed:false without ever moving that ref, leaving a branch
+// whose next `axi run` push is rejected non-fast-forward.
+func newCLIStaleGateBranchFixture(t *testing.T) cliRecoverFixture {
+	t.Helper()
+	f := newCLIRecoverFixture(t)
+	// Rewind the gate branch to the pre-rebase commit and make the recorded
+	// pipeline head a rewrite of it, reachable only through the run recovery
+	// ref, exactly as terminalization leaves it.
+	cliGit(t, f.local, "checkout", "main")
+	if err := os.WriteFile(filepath.Join(f.local, "base.txt"), []byte("moved base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, f.local, "add", "base.txt")
+	cliGit(t, f.local, "commit", "-m", "advance main")
+	newBase := cliGit(t, f.local, "rev-parse", "HEAD")
+	cliGit(t, f.local, "checkout", "feature/recover")
+
+	rewriter := filepath.Join(t.TempDir(), "rewriter")
+	cliGit(t, filepath.Dir(rewriter), "-c", "core.autocrlf=false", "clone", f.gate, rewriter)
+	cliGit(t, rewriter, "config", "user.name", "Pipeline")
+	cliGit(t, rewriter, "config", "user.email", "pipeline@example.com")
+	cliGit(t, rewriter, "fetch", f.local, newBase)
+	cliGit(t, rewriter, "checkout", "--detach", f.preserved)
+	cliGit(t, rewriter, "rebase", "--onto", newBase, f.base)
+	rewritten := cliGit(t, rewriter, "rev-parse", "HEAD")
+	cliGit(t, rewriter, "push", "origin", "HEAD:refs/no-mistakes/recover/"+f.runID)
+	cliGit(t, f.gate, "update-ref", "refs/heads/feature/recover", f.submitted)
+
+	nmPaths, err := paths.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := db.Open(nmPaths.DB())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.UpdateRunStatusWithVerifiedHead(f.runID, types.RunCancelled, rewritten); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cliGit(t, f.local, "fetch", "--no-tags", f.gate, "refs/no-mistakes/recover/"+f.runID)
+	cliGit(t, f.local, "reset", "--hard", rewritten)
+	f.preserved = rewritten
+	return f
+}
+
+// TestAxiRecoverMovesStaleGateBranchInsteadOfFalselyReportingRecovery is the
+// end-to-end regression: plain --recover must refuse rather than stamp custody
+// it cannot deliver, and the offered keep-local recovery must leave the branch
+// actually pushable.
+func TestAxiRecoverMovesStaleGateBranchInsteadOfFalselyReportingRecovery(t *testing.T) {
+	f := newCLIStaleGateBranchFixture(t)
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("fixture gate branch = %s, want stale %s", got, f.submitted)
+	}
+
+	status, err := executeCmd("axi", "sync", "--check")
+	var checkExit *exitError
+	if err == nil || !asExitError(err, &checkExit) || checkExit.code != 1 {
+		t.Fatalf("blocked check should exit 1, got %#v\n%s", err, status)
+	}
+	for _, want := range []string{"safety: blocked_pipeline_owned_recoverable", "code: recover_custody", "command: no-mistakes axi sync --recover --keep-local"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("stale-gate status missing %q:\n%s", want, status)
+		}
+	}
+
+	before := cliRecoveryGitSnapshot(t, f)
+	refused, err := executeCmd("axi", "sync", "--recover")
+	var ee *exitError
+	if err == nil || !asExitError(err, &ee) || ee.code != 1 {
+		t.Fatalf("plain recovery should refuse, got %#v\n%s", err, refused)
+	}
+	for _, want := range []string{"safety: blocked_recover_gate_diverged", "command: no-mistakes axi sync --recover --keep-local"} {
+		if !strings.Contains(refused, want) {
+			t.Errorf("plain recovery refusal missing %q:\n%s", want, refused)
+		}
+	}
+	if strings.Contains(refused, "recovered: true") {
+		t.Fatalf("plain recovery claimed a custody return:\n%s", refused)
+	}
+	if after := cliRecoveryGitSnapshot(t, f); after != before {
+		t.Fatal("refused plain recovery changed a branch, ref, or worktree")
+	}
+
+	recovered, err := executeCmd("axi", "sync", "--recover", "--keep-local")
+	if err != nil {
+		t.Fatalf("keep-local recovery: %v\n%s", err, recovered)
+	}
+	if !strings.Contains(recovered, "recovered: true") {
+		t.Fatalf("keep-local recovery did not return custody:\n%s", recovered)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate branch after recovery = %s, want the kept local head %s", got, f.preserved)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/no-mistakes/recover-gate/"+f.runID); got != f.submitted {
+		t.Fatalf("replaced gate head anchor = %s, want %s", got, f.submitted)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("keep-local recovery moved the worktree to %s", got)
+	}
+	cliGit(t, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover")
+}
+
 // newCLIMissingPreservedHeadFixture reproduces the wedged custody state from
 // a cancelled pre-push run whose recorded pipeline heads were then rebuilt
 // out of the operator worktree: the run still holds the branch, but the

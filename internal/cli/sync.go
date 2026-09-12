@@ -335,10 +335,16 @@ func humanSyncSummary(state branchsync.State) string {
 			if state.Recovery != nil && state.Recovery.KeepLocal {
 				return "later pipeline work is preserved by a verified archive; recover custody at the exact required head with `no-mistakes sync --recover --keep-local`"
 			}
+			if branchsync.KeepLocalRecoveryOffered(&state) {
+				return "run ended without publishing its pipeline commits and the local gate branch diverged from the local head; recover custody with `no-mistakes sync --recover --keep-local`, which keeps the local head and moves the gate branch to it"
+			}
 			return "run ended without publishing its pipeline commits; recover custody with `no-mistakes sync --recover`. `no-mistakes rerun` resumes validating the selected preserved head, but refuses a known clean caller HEAD mismatch. If heads differ, inspect `no-mistakes axi status` and follow its exact `branch_sync.next_action.command` for custody or synchronization, then submit intended local commits with a fresh `no-mistakes axi run` once custody permits"
 		}
 		if state.Safety == "blocked_recover_preserved_head_missing" {
 			return "run ended without a recoverable preserved head; recover custody with `no-mistakes sync --recover --keep-local` to keep the current local head"
+		}
+		if state.Safety == "blocked_recover_gate_diverged" {
+			return "the local gate branch diverged from the local head, so custody was not returned; recover custody with `no-mistakes sync --recover --keep-local`, which keeps the local head and moves the gate branch to it"
 		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
@@ -414,7 +420,7 @@ func runAxiSync(cmd *cobra.Command, check, recover, keepLocal bool, bindArchiveR
 	if state.NextAction != nil {
 		help = append(help, "Run `"+state.NextAction.Command+"`")
 	}
-	if state.Safety == "blocked_pipeline_owned_recoverable" && (state.Recovery == nil || !state.Recovery.KeepLocal) {
+	if state.Safety == "blocked_pipeline_owned_recoverable" && (state.Recovery == nil || !state.Recovery.KeepLocal) && !branchsync.KeepLocalRecoveryOffered(&state) {
 		help = append(help, "Run `no-mistakes rerun` instead to resume validating the selected preserved pipeline head; it refuses a known clean caller HEAD mismatch. If heads differ, inspect `no-mistakes axi status` and follow its exact `branch_sync.next_action.command` for custody or synchronization, then submit intended local commits with a fresh `no-mistakes axi run` once custody permits")
 	}
 	if len(help) > 0 {
