@@ -194,6 +194,7 @@ type Service struct {
 	beforeRecoverWorktreeMove func()
 	beforeRecoverBranchMove   func()
 	afterRecoverBranchMove    func()
+	beforeRecoverGateMove     func()
 }
 
 // remoteTimeout returns the bounded deadline budget for one remote
@@ -1211,6 +1212,13 @@ func preservedContainsLocalWork(ctx context.Context, dir, local, preserved strin
 // uncommitted changes and loses nothing: containment was proven before the move
 // and the pre-recovery head stays anchored. Custody is stamped only after the
 // whole move is verified.
+//
+// Moving the operator's ref is not the whole custody return. The gate's shared
+// refs/heads/<branch> must end up somewhere the recovered head can be pushed
+// over, which planAdoptGateMove decides read-only before anything is touched
+// and this function then performs with the same anchor-then-CAS machinery the
+// keep-local cells use. Both moves are verified before custody is stamped, and
+// a stamp that fails after the gate already moved rolls the gate back.
 func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state State, preserved string) State {
 	if s.beforeRecoverWorktreeMove != nil {
 		s.beforeRecoverWorktreeMove()
@@ -1221,6 +1229,13 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 	clean, _ := worktreeClean(ctx, wd)
 	if branchErr != nil || branch != state.Local.Branch || headErr != nil || head != state.Local.Head || !clean {
 		return blockedPlan(state, StatePipelineOwned, "blocked_recover_assumptions_changed", "the local branch or worktree changed while custody was being returned; no files or refs were changed")
+	}
+	// The gate half is decided read-only first, so a gate this recovery cannot
+	// honestly repair refuses while the worktree, every ref, and the custody
+	// record are all still untouched.
+	gateMove, gatePlanBlocked, gatePlanOK := s.planAdoptGateMove(ctx, state, run, head, preserved)
+	if !gatePlanOK {
+		return gatePlanBlocked
 	}
 	// The containment proof runs before the anchor and the move so that no
 	// slow work sits between the last guard and the mutation.
@@ -1307,7 +1322,149 @@ func (s *Service) recoverAdoptPreserved(ctx context.Context, run *db.Run, state 
 		state.NextAction = &NextAction{Code: "inspect_worktree", Command: "git status"}
 		return state
 	}
+	gateBlocked, gateMoved, gateOK := s.applyAdoptGateMove(ctx, run, state, preserved, gateMove)
+	if !gateOK {
+		return gateBlocked
+	}
+	if gateMoved {
+		return s.finishAdoptRecover(ctx, run, state, preserved, gateMove)
+	}
 	return s.finishRecover(ctx, run, true)
+}
+
+// adoptGateMove describes the gate branch half of an adopt-cell custody return:
+// whether the shared ref has to move at all, the exact head the
+// compare-and-swap is pinned to, and whether that replaced head must be
+// anchored first because the move would otherwise strand it.
+type adoptGateMove struct {
+	required bool
+	from     string
+	anchor   bool
+}
+
+// planAdoptGateMove decides the gate branch half of an adopt-cell custody
+// return without touching anything, so an unexplained gate refuses while the
+// worktree, every ref, and the custody record are still untouched.
+//
+// Adopting the preserved head is the one recovery that moves the gate's shared
+// branch ref FORWARD onto a pipeline-produced head rather than onto a head the
+// operator already holds. It has to: a run that rebased in its DETACHED gate
+// worktree and died before pushing leaves refs/heads/<branch> at the pre-rebase
+// commit while the rewritten head survives only at the run recovery ref, so
+// adopting that head locally and leaving the gate behind stamps custody on a
+// branch whose next `no-mistakes axi run` push is rejected non-fast-forward,
+// with no supported way out (the keep-local cells cannot reach this state,
+// because discovery correctly offers plain --recover while the operator cannot
+// see the rewritten head at all).
+//
+// Exactly three gate heads are accepted, and this recovery has already proven
+// something about every one of them:
+//
+//   - the preserved head itself: the gate is already where custody must return,
+//     so nothing moves.
+//   - an ancestor of the preserved head: an ordinary fast-forward, which
+//     discards nothing by construction.
+//   - the exact pre-recovery local head the containment proof was computed
+//     against: the stranded case this path exists for. That move is NOT a
+//     fast-forward, so the replaced head is anchored at
+//     refs/no-mistakes/recover-gate/<run> before the swap, and
+//     preservedContainsLocalWork has already proven the preserved head carries
+//     all of its content.
+//
+// Ancestry is decided in the GATE, which is the one repository proven to hold
+// both commits here: the gate branch is its own ref and the preserved head was
+// verified there before it was imported. A gate too damaged to answer falls
+// through to the refusal below rather than to a move.
+//
+// Anything else - a gate head that descends from the preserved head, or one
+// unrelated to both - is evidence this recovery cannot explain. Moving the
+// shared ref there would either rewind published pipeline work or guess, so it
+// refuses for manual reconciliation. Keep-local is deliberately not offered:
+// at this point the operator's own head is the PRE-rebase commit, so keeping it
+// would rewind the gate over both the unexplained head and the rewritten one.
+// An absent gate branch needs no move at all - a fresh push simply creates it.
+func (s *Service) planAdoptGateMove(ctx context.Context, state State, run *db.Run, head, preserved string) (adoptGateMove, State, bool) {
+	gateDir := strings.TrimSpace(s.GateDir)
+	if gateDir == "" {
+		return adoptGateMove{}, blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", "no local gate is configured for this repository, so the gate branch cannot be moved onto the adopted pipeline head; no files or refs were changed"), false
+	}
+	if _, err := os.Stat(gateDir); err != nil {
+		return adoptGateMove{}, blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", "the local gate is unavailable, so the gate branch cannot be moved onto the adopted pipeline head; no files or refs were changed"), false
+	}
+	gateHead, exists, err := git.ExactRefTarget(ctx, gateDir, "refs/heads/"+state.Local.Branch)
+	if err != nil {
+		return adoptGateMove{}, blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unavailable", fmt.Sprintf("the local gate branch %s could not be inspected, so custody cannot be returned onto a usable branch; no files or refs were changed", state.Local.Branch)), false
+	}
+	if !exists || gateHead == "" || gateHead == preserved {
+		return adoptGateMove{}, State{}, true
+	}
+	if !objectExists(ctx, gateDir, preserved) {
+		return adoptGateMove{}, blockedPlan(state, StatePipelineOwned, "blocked_recover_preserved_head_missing", fmt.Sprintf("the preserved pipeline head %s is missing from the local gate, so the gate branch cannot be moved onto it; no files or refs were changed", preserved)), false
+	}
+	if isAncestor(ctx, gateDir, gateHead, preserved) {
+		return adoptGateMove{required: true, from: gateHead}, State{}, true
+	}
+	if gateHead == head {
+		// The replaced head is not reachable from the preserved head, so the
+		// anchor that keeps it alive must be writable before anything moves.
+		compatible, err := recoveryGateAnchorCompatible(ctx, gateDir, run.ID, gateHead)
+		if err != nil || !compatible {
+			return adoptGateMove{}, blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", fmt.Sprintf("the gate head %s this recovery would replace conflicts with the existing run recovery anchor %s; inspect both refs before returning custody; no files or refs were changed", gateHead, custody.RecoveryGateRef(run.ID))), false
+		}
+		return adoptGateMove{required: true, from: gateHead, anchor: true}, State{}, true
+	}
+	blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_unexpected_head", fmt.Sprintf("the local gate branch %s is at %s, which is neither the preserved pipeline head %s, an ancestor of it, nor the pre-recovery local head %s that head was proven to contain, so custody cannot be returned onto a usable branch; inspect all three heads and reconcile manually; no files or refs were changed", state.Local.Branch, gateHead, preserved, head))
+	blocked.NextAction = &NextAction{Code: "inspect_and_reconcile_manually", Command: "no-mistakes axi status"}
+	return adoptGateMove{}, blocked, false
+}
+
+// applyAdoptGateMove anchors the head the swap replaces and then moves the gate
+// branch onto the adopted pipeline head with an atomic compare-and-swap pinned
+// to the head planAdoptGateMove observed, so a concurrent gate push wins and
+// this recovery refuses rather than clobbering it. It reports whether the gate
+// actually moved, which is what the caller needs in order to roll it back.
+func (s *Service) applyAdoptGateMove(ctx context.Context, run *db.Run, state State, preserved string, move adoptGateMove) (State, bool, bool) {
+	if !move.required {
+		return State{}, false, true
+	}
+	// Both refusals below report changed:true: the worktree half of the move
+	// has already happened and the branch really is at the adopted head, so
+	// reporting an unchanged branch would be the same dishonesty this whole
+	// fix exists to remove.
+	if move.anchor {
+		if err := custody.PreserveRecoveryAnchor(ctx, s.GateDir, custody.RecoveryGateRef(run.ID), move.from); err != nil {
+			blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", fmt.Sprintf("the branch reached the adopted pipeline head %s, but the gate head %s it replaces could not be anchored, so the gate branch was left untouched and custody was not recorded; re-run the recovery", preserved, move.from))
+			blocked.Changed = true
+			return blocked, false, false
+		}
+	}
+	if s.beforeRecoverGateMove != nil {
+		s.beforeRecoverGateMove()
+	}
+	if _, err := git.Run(ctx, s.GateDir, "update-ref", "refs/heads/"+state.Local.Branch, preserved, move.from); err != nil {
+		blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_race", fmt.Sprintf("the branch reached the adopted pipeline head %s, but the gate branch changed while custody was being returned, so it was left untouched and custody was not recorded; re-run the recovery, which re-classifies custody from the branch's new position", preserved))
+		blocked.Changed = true
+		return blocked, false, false
+	}
+	return State{}, true, true
+}
+
+// finishAdoptRecover stamps custody after both halves of the adopt move
+// succeeded, and restores the gate branch to the exact head the swap replaced
+// when the stamp fails, so a recovery that cannot be recorded never leaves the
+// shared ref moved on its own.
+func (s *Service) finishAdoptRecover(ctx context.Context, run *db.Run, state State, preserved string, move adoptGateMove) State {
+	result := s.finishRecover(ctx, run, true)
+	if result.Recovered {
+		return result
+	}
+	branchRef := "refs/heads/" + state.Local.Branch
+	if _, err := git.Run(context.WithoutCancel(ctx), s.GateDir, "update-ref", branchRef, move.from, preserved); err != nil {
+		result.Error += fmt.Sprintf("; rollback could not restore gate branch %s from %s to %s", branchRef, preserved, move.from)
+	} else {
+		result.Error += "; the gate branch was restored to its exact pre-recovery head"
+	}
+	return result
 }
 
 func (s *Service) anchorReachablePreserved(ctx context.Context, state State, runID, preserved string) (State, bool) {

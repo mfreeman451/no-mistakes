@@ -346,6 +346,9 @@ func humanSyncSummary(state branchsync.State) string {
 		if state.Safety == "blocked_recover_gate_diverged" {
 			return "the local gate branch diverged from the local head, so custody was not returned; recover custody with `no-mistakes sync --recover --keep-local`, which keeps the local head and moves the gate branch to it"
 		}
+		if state.Safety == "blocked_recover_gate_unexpected_head" {
+			return "the local gate branch is at a head this recovery cannot explain, so custody was not returned; inspect the gate branch, the preserved pipeline head, and the local head with `no-mistakes axi status` and reconcile manually"
+		}
 		return "pipeline fix is not pushed yet; do not make local follow-up commits"
 	case branchsync.StateCustodyReturned:
 		return "custody returned; the branch is yours - start a fresh run when ready"
