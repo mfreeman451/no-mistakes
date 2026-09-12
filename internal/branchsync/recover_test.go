@@ -2594,16 +2594,18 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 	}
 }
 
-// newStaleGateBranchRecoverFixture reproduces the gate-ref corruption a mid-run
+// newStaleGateBranchAdoptFixture reproduces the gate-ref corruption a mid-run
 // history rewrite used to leave behind (the `updateHeadSHA` bug fixed in
 // internal/pipeline/steps/rebase.go): the run's detached worktree rebased the
-// submitted head onto a newer base, so the verified pipeline head is a REWRITE
-// of the submitted commit, but the gate's shared refs/heads/<branch> was never
-// moved and still points at the pre-rebase commit - which is therefore NOT an
-// ancestor of the head the operator now holds. The operator's worktree is at
-// that verified pipeline head (relation equal), so recovery takes the
-// reachable-preserved cell.
-func newStaleGateBranchRecoverFixture(t *testing.T) *recoverFixture {
+// submitted head onto a newer base and died before pushing, so the verified
+// pipeline head is a REWRITE of the submitted commit that survives only at the
+// run recovery ref, while the gate's shared refs/heads/<branch> was never moved
+// and still points at the pre-rebase commit - which is therefore NOT an
+// ancestor of the rewritten head. This is the strand in its original shape:
+// the operator's own branch is still on that same pre-rebase commit and cannot
+// see the rewritten object at all, so discovery offers plain --recover and
+// recovery takes the diverged/adopt cell.
+func newStaleGateBranchAdoptFixture(t *testing.T) *recoverFixture {
 	t.Helper()
 	ctx := context.Background()
 	root := t.TempDir()
@@ -2673,14 +2675,12 @@ func newStaleGateBranchRecoverFixture(t *testing.T) *recoverFixture {
 	}
 	run, _ = database.GetRun(run.ID)
 
-	// The operator already holds the verified pipeline head.
-	mustRun(t, local, "fetch", "--no-tags", gate, custody.RecoveryRef(run.ID))
-	mustRun(t, local, "reset", "--hard", preserved)
-
 	if mustRun(t, gate, "rev-parse", "refs/heads/feature/recover") != submitted {
 		t.Fatalf("fixture gate branch is not the stale pre-rebase commit")
 	}
-	if _, err := gitpkg.Run(ctx, local, "merge-base", "--is-ancestor", submitted, preserved); err == nil {
+	// Ancestry is decided in the gate, the only repository holding both heads
+	// while the operator still cannot see the rewritten one at all.
+	if _, err := gitpkg.Run(ctx, gate, "merge-base", "--is-ancestor", submitted, preserved); err == nil {
 		t.Fatalf("fixture stale gate head %s must not be an ancestor of preserved head %s", submitted, preserved)
 	}
 	return &recoverFixture{
@@ -2689,6 +2689,17 @@ func newStaleGateBranchRecoverFixture(t *testing.T) *recoverFixture {
 		local:   local, gate: gate, remote: remote,
 		base: base, submitted: submitted, preserved: preserved,
 	}
+}
+
+// newStaleGateBranchRecoverFixture is the same strand after the operator has
+// already taken the rewritten head, which is what puts recovery in the
+// reachable-preserved (equal/ahead) cells instead of the adopt cell.
+func newStaleGateBranchRecoverFixture(t *testing.T) *recoverFixture {
+	t.Helper()
+	f := newStaleGateBranchAdoptFixture(t)
+	mustRun(t, f.local, "fetch", "--no-tags", f.gate, custody.RecoveryRef(f.run.ID))
+	mustRun(t, f.local, "reset", "--hard", f.preserved)
+	return f
 }
 
 func (f *recoverFixture) gateBranch() string {
@@ -2808,5 +2819,223 @@ func TestRecoverKeepLocalMovesStaleGateBranchWhenLocalIsAhead(t *testing.T) {
 	}
 	if _, err := gitpkg.Run(f.ctx, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover"); err != nil {
 		t.Fatalf("plain push to the gate after recovery still fails: %v", err)
+	}
+}
+
+// TestRecoverAdoptedPreservedHeadMovesStaleGateBranch is the regression for the
+// third stranded custody cell. A run rebased the gate's tracked commit in its
+// detached gate worktree and died before pushing, so the rewritten head exists
+// only at the run recovery ref while both the operator's branch and the gate's
+// shared branch ref are still the pre-rebase commit. Discovery offers plain
+// --recover, recovery lands in the diverged/adopt cell, and adopting the
+// rewritten head used to move only the operator's ref: custody was stamped
+// while the gate stayed behind at a commit the adopted head does not descend
+// from, so every later push was rejected non-fast-forward with no way out.
+func TestRecoverAdoptedPreservedHeadMovesStaleGateBranch(t *testing.T) {
+	t.Parallel()
+
+	f := newStaleGateBranchAdoptFixture(t)
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("fixture local head = %s, want the pre-rebase commit %s", got, f.submitted)
+	}
+	if got := f.gateBranch(); got != f.submitted {
+		t.Fatalf("fixture gate branch = %s, want the stale pre-rebase commit %s", got, f.submitted)
+	}
+	if objectExists(f.ctx, f.local, f.preserved) {
+		t.Fatal("fixture leaked the rewritten head into the operator worktree")
+	}
+
+	// Discovery offers the plain recovery, which is what routes this state into
+	// the adopt cell rather than the keep-local one.
+	inspected := f.service.InspectCached(f.ctx)
+	if inspected.Safety != "blocked_pipeline_owned_recoverable" {
+		t.Fatalf("adopt-cell inspection = %#v", inspected)
+	}
+	if inspected.NextAction == nil || inspected.NextAction.Code != "recover_custody" || inspected.NextAction.Command != RecoverCustodyCommand {
+		t.Fatalf("want plain recover_custody offer, got %#v", inspected.NextAction)
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("adopt recovery did not return custody: %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD = %s, want the adopted preserved head %s", got, f.preserved)
+	}
+	if got := f.gateBranch(); got != f.preserved {
+		t.Fatalf("gate branch after adopt recovery = %s, want the adopted preserved head %s", got, f.preserved)
+	}
+	// The replaced gate head stays reachable rather than being discarded.
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("replaced gate head anchor = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local head was not anchored: %s, want %s", got, f.submitted)
+	}
+	if !f.custodyReturned() {
+		t.Fatal("custody not stamped")
+	}
+	// The whole point of returning custody: the operator's next push lands.
+	mustWrite(t, filepath.Join(f.local, "after-recovery.txt"), "after recovery\n")
+	mustRun(t, f.local, "add", "after-recovery.txt")
+	mustRun(t, f.local, "commit", "-m", "work after recovery")
+	if _, err := gitpkg.Run(f.ctx, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover"); err != nil {
+		t.Fatalf("plain push to the gate after recovery still fails: %v", err)
+	}
+}
+
+// TestRecoverAdoptRefusesUnexplainedGateHeadWithoutMutation is the honesty half
+// of the adopt-cell gate move: the swap is only ever pinned to a head this
+// recovery has already proven something about, so a gate branch at an
+// unexplained commit refuses for manual reconciliation before anything moves,
+// rather than rewinding the shared ref onto the adopted head.
+func TestRecoverAdoptRefusesUnexplainedGateHeadWithoutMutation(t *testing.T) {
+	t.Parallel()
+
+	f := newStaleGateBranchAdoptFixture(t)
+	// Somebody else's work lands on the gate branch, unrelated to both the
+	// pre-rebase commit and the rewritten head.
+	writer := filepath.Join(t.TempDir(), "writer")
+	mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
+	configureIdentity(t, writer)
+	mustRun(t, writer, "checkout", "feature/recover")
+	mustWrite(t, filepath.Join(writer, "other.txt"), "other work\n")
+	mustRun(t, writer, "add", "other.txt")
+	mustRun(t, writer, "commit", "-m", "unrelated gate work")
+	mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+	unexplained := mustRun(t, writer, "rev-parse", "HEAD")
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed {
+		t.Fatalf("recovery claimed success over an unexplained gate head: %#v", state)
+	}
+	if state.Safety != "blocked_recover_gate_unexpected_head" {
+		t.Fatalf("safety = %q, want blocked_recover_gate_unexpected_head (%#v)", state.Safety, state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "inspect_and_reconcile_manually" || state.NextAction.Command != "no-mistakes axi status" {
+		t.Fatalf("want manual reconciliation guidance, got %#v", state.NextAction)
+	}
+	if got := f.gateBranch(); got != unexplained {
+		t.Fatalf("refusal moved the gate branch to %s", got)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("refusal moved HEAD to %s", got)
+	}
+	if _, err := gitpkg.Run(f.ctx, f.local, "rev-parse", "--verify", f.localAnchorRef()); err == nil {
+		t.Fatal("refusal wrote the pre-recovery local anchor")
+	}
+	if _, err := gitpkg.Run(f.ctx, f.gate, "rev-parse", "--verify", custody.RecoveryGateRef(f.run.ID)); err == nil {
+		t.Fatal("refusal wrote the replaced-gate-head anchor")
+	}
+	if f.custodyReturned() {
+		t.Fatal("refusal stamped custody")
+	}
+}
+
+// TestRecoverAdoptRefusesWhenGateBranchMovesBeforeTheSwap covers the
+// compare-and-swap itself: the gate head is re-pinned to the exact commit the
+// plan observed, so a gate push that lands between the plan and the swap wins
+// and recovery refuses with custody unstamped instead of clobbering it.
+func TestRecoverAdoptRefusesWhenGateBranchMovesBeforeTheSwap(t *testing.T) {
+	t.Parallel()
+
+	f := newStaleGateBranchAdoptFixture(t)
+	var raced string
+	f.service.beforeRecoverGateMove = func() {
+		writer := filepath.Join(t.TempDir(), "racer")
+		mustRun(t, filepath.Dir(writer), "-c", "core.autocrlf=false", "clone", f.gate, writer)
+		configureIdentity(t, writer)
+		mustRun(t, writer, "checkout", "feature/recover")
+		mustWrite(t, filepath.Join(writer, "race.txt"), "race\n")
+		mustRun(t, writer, "add", "race.txt")
+		mustRun(t, writer, "commit", "-m", "racing push")
+		mustRun(t, writer, "push", "origin", "HEAD:refs/heads/feature/recover")
+		raced = mustRun(t, writer, "rev-parse", "HEAD")
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered {
+		t.Fatalf("racing adopt recovery claimed success: %#v", state)
+	}
+	if state.Safety != "blocked_recover_gate_race" {
+		t.Fatalf("safety = %q, want blocked_recover_gate_race (%#v)", state.Safety, state)
+	}
+	if got := f.gateBranch(); got != raced {
+		t.Fatalf("gate branch = %s, want the racing push %s left intact", got, raced)
+	}
+	if f.custodyReturned() {
+		t.Fatal("racing recovery stamped custody")
+	}
+	// The commits both sides care about survive the refusal.
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryGateRef(f.run.ID)); got != f.submitted {
+		t.Fatalf("replaced gate head anchor = %s, want %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local anchor = %s, want %s", got, f.submitted)
+	}
+}
+
+// TestRecoverAdoptRollsBackGateBranchWhenCustodyStampFails pins the partial
+// failure: the gate branch must never be left moved by a recovery that could
+// not be recorded, or the next run would push over commits nothing has stamped
+// custody for.
+func TestRecoverAdoptRollsBackGateBranchWhenCustodyStampFails(t *testing.T) {
+	t.Parallel()
+
+	f := newStaleGateBranchAdoptFixture(t)
+	// Closing the database makes the custody stamp - and only the custody
+	// stamp - fail, after both halves of the move have already happened.
+	f.service.afterRecoverBranchMove = func() {
+		if err := f.db.Close(); err != nil {
+			t.Fatalf("close database: %v", err)
+		}
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered {
+		t.Fatalf("recovery reported success without recording custody: %#v", state)
+	}
+	if got := f.gateBranch(); got != f.submitted {
+		t.Fatalf("gate branch after a failed stamp = %s, want rollback to %s", got, f.submitted)
+	}
+	if !strings.Contains(state.Error, "restored to its exact pre-recovery head") {
+		t.Fatalf("state did not report the gate rollback: %q", state.Error)
+	}
+	// The rewritten head the worktree adopted stays reachable either way.
+	if got := mustRun(t, f.gate, "rev-parse", custody.RecoveryRef(f.run.ID)); got != f.preserved {
+		t.Fatalf("preserved head anchor = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.localAnchorRef()); got != f.submitted {
+		t.Fatalf("pre-recovery local anchor = %s, want %s", got, f.submitted)
+	}
+}
+
+// TestRecoverAdoptFastForwardsLaggingGateBranchWithoutAnchoring covers the
+// third accepted gate head: one the preserved head already descends from moves
+// by ordinary fast-forward, which strands nothing, so no replaced-head anchor
+// is written for it.
+func TestRecoverAdoptFastForwardsLaggingGateBranchWithoutAnchoring(t *testing.T) {
+	t.Parallel()
+
+	f := newStaleGateBranchAdoptFixture(t)
+	// Rewind the gate branch to a commit the rewritten head descends from.
+	lagging := mustRun(t, f.gate, "rev-parse", "refs/heads/main")
+	mustRun(t, f.gate, "update-ref", "refs/heads/feature/recover", lagging, f.submitted)
+	if !isAncestor(f.ctx, f.gate, lagging, f.preserved) {
+		t.Fatal("fixture lagging gate head is not an ancestor of the preserved head")
+	}
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed {
+		t.Fatalf("adopt recovery over a lagging gate branch failed: %#v", state)
+	}
+	if got := f.gateBranch(); got != f.preserved {
+		t.Fatalf("gate branch = %s, want fast-forward to %s", got, f.preserved)
+	}
+	if _, err := gitpkg.Run(f.ctx, f.gate, "rev-parse", "--verify", custody.RecoveryGateRef(f.run.ID)); err == nil {
+		t.Fatal("a fast-forward gate move anchored a head it never stranded")
+	}
+	if !f.custodyReturned() {
+		t.Fatal("custody not stamped")
 	}
 }

@@ -529,13 +529,14 @@ func cliRecoveryGitSnapshot(t *testing.T, f cliRecoverFixture) string {
 	}, "\n---\n")
 }
 
-// newCLIStaleGateBranchFixture reproduces the second custody defect end to end:
-// the run rewrote history in its DETACHED gate worktree, so the gate's shared
-// refs/heads/<branch> is still the pre-rebase commit while the operator holds
-// the verified pipeline head. `axi sync --recover --keep-local` used to report
-// recovered:true / changed:false without ever moving that ref, leaving a branch
-// whose next `axi run` push is rejected non-fast-forward.
-func newCLIStaleGateBranchFixture(t *testing.T) cliRecoverFixture {
+// newCLIStaleGateBranchAdoptFixture reproduces the mid-rebase kill end to end
+// in its original shape: the run rewrote history in its DETACHED gate worktree
+// and died before pushing, so the rewritten head survives only at the run
+// recovery ref while both the operator's branch and the gate's shared
+// refs/heads/<branch> are still the pre-rebase commit. Nothing the operator can
+// see carries the rewritten head, which is what routes recovery into the
+// diverged/adopt cell under a plain --recover.
+func newCLIStaleGateBranchAdoptFixture(t *testing.T) cliRecoverFixture {
 	t.Helper()
 	f := newCLIRecoverFixture(t)
 	// Rewind the gate branch to the pre-rebase commit and make the recorded
@@ -576,10 +577,76 @@ func newCLIStaleGateBranchFixture(t *testing.T) cliRecoverFixture {
 		t.Fatal(err)
 	}
 
-	cliGit(t, f.local, "fetch", "--no-tags", f.gate, "refs/no-mistakes/recover/"+f.runID)
-	cliGit(t, f.local, "reset", "--hard", rewritten)
 	f.preserved = rewritten
 	return f
+}
+
+// newCLIStaleGateBranchFixture is the same strand after the operator has
+// already taken the rewritten head, which is what puts recovery in the
+// reachable-preserved (equal/ahead) cells instead of the adopt cell.
+func newCLIStaleGateBranchFixture(t *testing.T) cliRecoverFixture {
+	t.Helper()
+	f := newCLIStaleGateBranchAdoptFixture(t)
+	cliGit(t, f.local, "fetch", "--no-tags", f.gate, "refs/no-mistakes/recover/"+f.runID)
+	cliGit(t, f.local, "reset", "--hard", f.preserved)
+	return f
+}
+
+// TestAxiRecoverAdoptsRewrittenHeadAndMovesStaleGateBranch is the end-to-end
+// regression for the third stranded cell. `axi sync --recover` adopts the
+// rewritten head into the operator's branch, and it used to stamp custody there
+// while the gate's shared ref stayed at the pre-rebase commit the adopted head
+// does not descend from - so the very next `axi run` push was rejected
+// non-fast-forward and no supported command could clear it.
+func TestAxiRecoverAdoptsRewrittenHeadAndMovesStaleGateBranch(t *testing.T) {
+	f := newCLIStaleGateBranchAdoptFixture(t)
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("fixture gate branch = %s, want stale %s", got, f.submitted)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatalf("fixture local head = %s, want the pre-rebase commit %s", got, f.submitted)
+	}
+
+	status, err := executeCmd("axi", "sync", "--check")
+	var checkExit *exitError
+	if err == nil || !asExitError(err, &checkExit) || checkExit.code != 1 {
+		t.Fatalf("blocked check should exit 1, got %#v\n%s", err, status)
+	}
+	for _, want := range []string{"safety: blocked_pipeline_owned_recoverable", "code: recover_custody", "command: no-mistakes axi sync --recover"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("adopt-cell status missing %q:\n%s", want, status)
+		}
+	}
+	if strings.Contains(status, "--recover --keep-local") {
+		t.Errorf("adopt-cell status offered keep-local:\n%s", status)
+	}
+
+	recovered, err := executeCmd("axi", "sync", "--recover")
+	if err != nil {
+		t.Fatalf("adopt recovery: %v\n%s", err, recovered)
+	}
+	if !strings.Contains(recovered, "recovered: true") {
+		t.Fatalf("adopt recovery did not return custody:\n%s", recovered)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "HEAD"); got != f.preserved {
+		t.Fatalf("HEAD after recovery = %s, want the adopted head %s", got, f.preserved)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.preserved {
+		t.Fatalf("gate branch after recovery = %s, want the adopted head %s", got, f.preserved)
+	}
+	if got := cliGit(t, f.gate, "rev-parse", "refs/no-mistakes/recover-gate/"+f.runID); got != f.submitted {
+		t.Fatalf("replaced gate head anchor = %s, want %s", got, f.submitted)
+	}
+	if got := cliGit(t, f.local, "rev-parse", "refs/no-mistakes/recover-local/"+f.runID); got != f.submitted {
+		t.Fatalf("pre-recovery local anchor = %s, want %s", got, f.submitted)
+	}
+	// The whole point of returning custody: the operator's next push lands.
+	if err := os.WriteFile(filepath.Join(f.local, "after-recovery.txt"), []byte("after recovery\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cliGit(t, f.local, "add", "after-recovery.txt")
+	cliGit(t, f.local, "commit", "-m", "work after recovery")
+	cliGit(t, f.local, "push", f.gate, "refs/heads/feature/recover:refs/heads/feature/recover")
 }
 
 // TestAxiRecoverMovesStaleGateBranchInsteadOfFalselyReportingRecovery is the

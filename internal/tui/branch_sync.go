@@ -137,7 +137,8 @@ func renderRecoverConfirmation(state branchsync.State, width int) string {
 	default:
 		fmt.Fprintf(&b, "Recovery returns custody by fast-forwarding a clean behind worktree, or by\n")
 		fmt.Fprintf(&b, "adopting a diverged preserved head only when it is proven to carry every\n")
-		fmt.Fprintf(&b, "local change.\n\n")
+		fmt.Fprintf(&b, "local change. Adopting also moves the gate branch onto that head so the\n")
+		fmt.Fprintf(&b, "branch stays pushable, anchoring the head it replaces first.\n\n")
 	}
 	fmt.Fprintf(&b, "Local branch:   %s\n", state.Local.Branch)
 	fmt.Fprintf(&b, "Local HEAD:     %s\n", state.Local.Head)
