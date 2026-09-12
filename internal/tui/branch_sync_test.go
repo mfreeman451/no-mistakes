@@ -305,6 +305,59 @@ func TestArchiveRecoveryConfirmationUsesOnlyGuardedKeepLocalAction(t *testing.T)
 	}
 }
 
+// TestDivergentGateBranchRecoveryUsesTheOfferedKeepLocalAction pins the TUI
+// half of the false-recovery fix: a reachable preserved head whose gate branch
+// diverged is keep-local-only with no archive evidence, so `u` must run the
+// offered keep-local recovery instead of the plain one that refuses.
+func TestDivergentGateBranchRecoveryUsesTheOfferedKeepLocalAction(t *testing.T) {
+	run := &ipc.RunInfo{ID: "run-stale-gate", Branch: "feature", Status: types.RunCancelled}
+	m := NewModel("socket", nil, run)
+	stranded := branchsync.State{
+		State: branchsync.StatePipelineOwned, Relation: branchsync.RelationEqual, Safety: "blocked_pipeline_owned_recoverable",
+		Local:      branchsync.LocalState{Branch: "feature", Head: strings.Repeat("a", 40), Clean: true},
+		Pipeline:   branchsync.PipelineState{RunID: run.ID, Status: "cancelled", Phase: "pre_push", CurrentHead: strings.Repeat("a", 40)},
+		NextAction: &branchsync.NextAction{Code: "recover_custody", Command: branchsync.RecoverCustodyKeepLocalCommand},
+	}
+	m.branchSync = &stranded
+	called := false
+	m.syncRecover = func(keepLocal bool) branchsync.State {
+		called = true
+		if !keepLocal {
+			t.Fatal("divergent-gate recovery did not use keep-local")
+		}
+		recovered := stranded
+		recovered.State = branchsync.StateCustodyReturned
+		recovered.Safety = "custody_returned"
+		recovered.Recovered = true
+		return recovered
+	}
+
+	view := stripANSI(renderLocalBranchStatus(m.branchSync, false, 80))
+	for _, want := range []string{"gate branch diverged", "u recover custody"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("divergent-gate status missing %q:\n%s", want, view)
+		}
+	}
+	next, cmd := m.handleKey(keyMsg("u"))
+	m = next.(Model)
+	if cmd != nil || !m.recoverConfirm {
+		t.Fatal("divergent-gate recovery did not open confirmation")
+	}
+	if confirmation := stripANSI(m.View()); !strings.Contains(confirmation, "moves the gate") {
+		t.Errorf("divergent-gate confirmation missing the gate move:\n%s", confirmation)
+	}
+	next, cmd = m.handleKey(keyMsg("enter"))
+	m = next.(Model)
+	if cmd == nil {
+		t.Fatal("divergent-gate recovery produced no command")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(Model)
+	if !called || !m.branchSync.Recovered {
+		t.Fatalf("divergent-gate recovery result = %#v", m.branchSync)
+	}
+}
+
 // TestActivePipelineOwnedStateOffersNoRecoveryAction pins that the recovery
 // affordance never appears while the owning run is still active.
 func TestActivePipelineOwnedStateOffersNoRecoveryAction(t *testing.T) {

@@ -21,9 +21,12 @@ func renderLocalBranchStatus(state *branchsync.State, refreshing bool, width int
 		switch state.State {
 		case branchsync.StatePipelineOwned:
 			if recoverableBranchSync(state) {
-				if archiveKeepLocalRecovery(state) {
+				switch {
+				case archiveKeepLocalRecovery(state):
 					message = "Later pipeline work is preserved by a verified archive. Recover custody while keeping the exact required local head."
-				} else {
+				case branchsync.KeepLocalRecoveryOffered(state):
+					message = "Run ended without publishing its pipeline commits, and the local gate branch diverged from the local head. Recover custody to keep the local head and move the gate branch to it."
+				default:
 					message = "Run ended without publishing its pipeline commits; they are preserved in the local gate. Recover custody to take the branch back, or rerun to resume validation."
 				}
 				footer = "u recover custody"
@@ -122,11 +125,16 @@ func renderRecoverConfirmation(state branchsync.State, width int) string {
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "The run ended %s without publishing its pipeline commits.\n", state.Pipeline.Status)
-	if archiveKeepLocalRecovery(&state) {
+	switch {
+	case archiveKeepLocalRecovery(&state):
 		fmt.Fprintf(&b, "A verified archive preserves the divergent later head. Recovery keeps the\n")
 		fmt.Fprintf(&b, "working branch at the exact required head and returns custody through the\n")
 		fmt.Fprintf(&b, "guarded keep-local path. It never selects or replays the archive.\n\n")
-	} else {
+	case branchsync.KeepLocalRecoveryOffered(&state):
+		fmt.Fprintf(&b, "The preserved pipeline head is already reachable locally, but the gate branch\n")
+		fmt.Fprintf(&b, "diverged from it. Recovery leaves the worktree untouched and moves the gate\n")
+		fmt.Fprintf(&b, "branch to the kept local head, anchoring the replaced gate head first.\n\n")
+	default:
 		fmt.Fprintf(&b, "Recovery returns custody by fast-forwarding a clean behind worktree, or by\n")
 		fmt.Fprintf(&b, "adopting a diverged preserved head only when it is proven to carry every\n")
 		fmt.Fprintf(&b, "local change.\n\n")
